@@ -2,8 +2,9 @@
 import argparse
 import os
 import openai
-import pinecone
+import weaviate
 import time
+import uuid
 import sys
 from collections import deque
 from typing import Dict, List
@@ -34,11 +35,8 @@ assert OPENAI_API_MODEL, "OPENAI_API_MODEL environment variable is missing from 
 if "gpt-4" in OPENAI_API_MODEL.lower():
     print(f"\033[91m\033[1m"+"\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"+"\033[0m\033[0m")
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east1-gcp")
-assert PINECONE_ENVIRONMENT, "PINECONE_ENVIRONMENT environment variable is missing from .env"
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "")
+assert WEAVIATE_URL, "WEAVIATE_URL environment variable is missing from .env"
 
 # Table config
 YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
@@ -55,20 +53,63 @@ assert YOUR_FIRST_TASK, "FIRST_TASK environment variable is missing from .env"
 print("\033[96m\033[1m"+"\n*****OBJECTIVE*****\n"+"\033[0m\033[0m")
 print(OBJECTIVE)
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI and Weaviate
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+client = weaviate.Client(
+    url=WEAVIATE_URL,
+    additional_headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+)
 
-# Create Pinecone index
+# Create Weaviate index
 table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(table_name, dimension=dimension, metric=metric, pod_type=pod_type)
+namespace_uuid = uuid.UUID('2f8ca1d2-ecd1-425d-91a4-41d99d372e0c')
 
-# Connect to the index
-index = pinecone.Index(table_name)
+def create_schema(delete_first: bool = False) -> None:
+    if delete_first:
+        client.schema.delete_class(table_name)
+    client.schema.get()
+    schema = {
+        "classes": [
+            {
+                "class": table_name,
+                "description": "",
+                "vectorizer": "text2vec-openai",
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "model": "ada",
+                        "modelVersion": "002",
+                        "type": "text",
+                    }
+                },
+                "properties": [
+                    {
+                        "dataType": ["text"],
+                        "description": "",
+                        "moduleConfig": {
+                            "text2vec-openai": {
+                                "skip": False,
+                                "vectorizePropertyName": False,
+                            }
+                        },
+                        "name": "result",
+                    },
+                    {
+                        "dataType": ["text"],
+                        "description": "",
+                        "name": "task",
+                    },
+                ],
+            },
+        ]
+    }
+    try:
+        client.schema.create(schema)
+    except weaviate.exceptions.UnexpectedStatusCodeException:
+        if delete_first:
+            raise
+
+create_schema(delete_first=True)
+
 
 # Task list
 task_list = deque([])
@@ -138,12 +179,15 @@ def execution_agent(objective: str, task: str) -> str:
     return openai_call(prompt, temperature=0.7, max_tokens=2000)
 
 def context_agent(query: str, n: int):
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True)
+    content = {"concepts": [query]}
+    query_obj = client.query.get(table_name, ['result', 'task'])
+    result = query_obj.with_near_text(content).with_limit(n).do()
+    results = []
+    for res in result.get("data", {}).get("Get", {}).get(table_name, []):
+        results.append(res['task'])
     #print("***** RESULTS *****")
     #print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata['task'])) for item in sorted_results]
+    return results
 
 # Add the first task
 first_task = {
@@ -172,11 +216,18 @@ while True:
         print("\033[93m\033[1m"+"\n*****TASK RESULT*****\n"+"\033[0m\033[0m")
         print(result)
 
-        # Step 2: Enrich result and store in Pinecone
+        # Step 2: Enrich result and store in Weaviate
         enriched_result = {'data': result}  # This is where you should enrich the result if needed
         result_id = f"result_{task['task_id']}"
         vector = enriched_result['data']  # extract the actual result from the dictionary
-        index.upsert([(result_id, get_ada_embedding(vector),{"task":task['task_name'],"result":result})])
+
+        result_uuid = uuid.uuid5(namespace_uuid, f'Result:{result_id}')
+        with client.batch as batch:
+            batch.add_data_object(
+                dict(result=result, task=task['task_name']),
+                table_name,
+                result_uuid
+            )
 
     # Step 3: Create new tasks and reprioritize task list
     new_tasks = task_creation_agent(OBJECTIVE,enriched_result, task["task_name"], [t["task_name"] for t in task_list])
